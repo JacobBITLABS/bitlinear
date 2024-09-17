@@ -81,7 +81,7 @@ class FrozenBitLinear(nn.Linear):
             out_features=bitlinear.out_features,
             bias=bias,
             # device=bitlinear.device,
-            #dtype=bitlinear.dtype,
+            # dtype=bitlinear.dtype,
         )
         self.eps = bitlinear.eps
         self.activation_range=bitlinear.activation_range
@@ -101,13 +101,9 @@ class FrozenBitLinear(nn.Linear):
 
         if self.pack_weights:
             self.w_quant = self.w_quant.to(dtype=torch.int8)
-            self.w_quant, self.w_quant, self.padding_size = self.pack_matrix(self.w_quant)
-             
+            self.w_quant, self.w_quant_shape, self.padding_size = self.pack_matrix(self.w_quant)
+        
         self.weight = None
-            # if isinstance(self.w_quant, torch.nn.Parameter):
-            #   self.weight = self.w_quant
-            # else:
-            #   self.weight = nn.Parameter(self.w_quant)
         
     def __repr__(self):
         return f"FrozenBitLinear(in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}, kernel={self.kernel}), activation_range={self.activation_range}, activation_measure={self.activation_measure}"
@@ -125,14 +121,25 @@ class FrozenBitLinear(nn.Linear):
 
 
     def pack_matrix(self, matrix):
-        # Flatten the input matrix
+        """
+        Parameters:
+            matrix : torch.tensor
+                matrix / weight a given layer in nn.module
+        Returns:
+            packed: torch.tensor(), dtype=int8
+            matrix.shape: torch.Size() 
+            padding_size: int
+        
+        This function packs the tensor containing integer-values into int8. The can fit 4 integer values represented by 2-bit into one.
+        """
+        print(matrix)
         flattened = matrix.view(-1)
 
         padding_size = (4 - (flattened.size(0) % 4)) % 4 # Compute no. padding elements to make row multiple of 4. %4 ensures that we don't add anything (3when pad elements is multiple of 4 -> (4-0) % 4 = 0
         if padding_size > 0:
             flattened = torch.cat([flattened, torch.zeros(padding_size, dtype=torch.int8)])
 
-        packed = torch.zeros((flattened.size(0) // 4,), dtype=torch.int8) # init to hold packed values
+        packed = torch.zeros((flattened.size(0) // 4,), dtype=torch.int8, requires_grad=False) # init to hold packed values
 
         # Pack values in groups of 4 2-bit values into int8
         # 0b11 -> 3 -> 11
@@ -141,16 +148,20 @@ class FrozenBitLinear(nn.Linear):
             chunk = flattened[i * 4:(i + 1) * 4] 
             packed[i] = ((chunk[0] & 0b11) << 6) | ((chunk[1] & 0b11) << 4) | ((chunk[2] & 0b11) << 2) | (chunk[3] & 0b11)
 
+        
+        print("packed: ", packed)
+        print("matrix.shape: ", matrix.shape)
+        print("padding_size: ", padding_size)
         return packed, matrix.shape, padding_size
 
 
     def unpack_matrix(self, packed_matrix, original_shape, padding_size):
-        # Initialize unpacked matrix (flattened)
+        # Initialize unpacked 'flattened' matrix
         unpacked = torch.zeros(packed_matrix.size(0) * 4, dtype=torch.int8)
 
         # Unpack each int8 into four 2-bit values
         for i, packed_value in enumerate(packed_matrix):
-            unpacked[i * 4 + 0] = (packed_value >> 6) & 0b11
+            unpacked[i * 4 + 0] = (packed_value >> 6) & 0b11 # right-shift and or with 11
             unpacked[i * 4 + 1] = (packed_value >> 4) & 0b11
             unpacked[i * 4 + 2] = (packed_value >> 2) & 0b11
             unpacked[i * 4 + 3] = packed_value & 0b11
@@ -166,45 +177,25 @@ class FrozenBitLinear(nn.Linear):
         return unpacked.view(original_shape)
 
 
-def freeze(
-    model, 
-    pack_weights=False,
-    ):
+def freeze(model, pack_weights=False):
     """
-        Parameters:
-            model : torch.nn.Module
-                Model with BitLinear modules to replace with FrozenBitLinear for faster inference
-            kernel : str or Kernel
-                Forward kernel to implement in the model
-            weightMeasure : str
-                str corresponding to a weight packing method
-                options are 'AbsMean', 'AbsMax', and 'AbsMedian'
-                default is 'AbsMean'
-            eps : float
-                value to clamp the weights to in the scaling step to avoid divide-by-zero
-                default is 1e-5
-            activation_measure : str
-                str corresponding to the activation quantization method
-                options are 'AbsMean', 'AbsMax', 'AbsMedian', and 'Fp16'
-                'AbsMax'
-            activation_range : int
-                number of bits to represent the activations in
-                default is 8
-            device : Optional(torch.device)
-            dtype : Optional(torch.dtype)
-
-        Returns:
-            None
-        
-        This function replaces all of the BitLinear instances in a model with FrozenBitLinear in order to
-        speed up inference. The weights are packed corresponding to the kernel.
-        """
+    Parameters:
+        model : torch.nn.Module
+            Model with BitLinear modules to replace with FrozenBitLinear for faster inference
+        pack_weights : bool
+            pack 1.58-bit weights (2bit) into Int()
+    Returns:
+        None
+    
+    This function replaces all of the BitLinear instances in a model with FrozenBitLinear in order to
+    speed up inference. Optionally the weights are packed corresponding to the kernel.
+    """
     
     for name, module in model.named_children():
         if isinstance(module, BitLinear):
             frozen_module = FrozenBitLinear(module, pack_weights=pack_weights)
             setattr(model, name, frozen_module)
-            
+
         else: # recursively iterate throughout the rest of the module
             freeze(module, pack_weights=pack_weights)
 
@@ -225,6 +216,7 @@ def replace_modules(model, old_class=nn.Linear, new_class=BitLinear, new_class_k
             setattr(model, name, new_module)
         else:
             replace_modules(module, old_class, new_class, new_class_kwargs, match_name, prefix=qual_name)
+
 
 def bitlinearize(model, old_class=nn.Linear, new_class=BitLinear, replacements=[{}]):
     for replacement in replacements:
